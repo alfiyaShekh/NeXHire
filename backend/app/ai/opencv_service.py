@@ -1,32 +1,24 @@
 import cv2
-import numpy as np
 
+cap = cv2.VideoCapture(0)
 
-class OpenCVService:
-    def __init__(self):
-        pass
+if not cap.isOpened():
+    print("Error: Could not open webcam")
+    exit()
 
-    def decode_frame(self, frame_bytes: bytes) -> np.ndarray:
-        """Decode image bytes into an OpenCV BGR image array."""
-        np_arr = np.frombuffer(frame_bytes, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        return image
+while True:
+    success, frame = cap.read()
+    frame = cv2.resize(frame, (800, 600))
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    def encode_frame(self, image: np.ndarray, format: str = ".jpg") -> bytes:
-        """Encode an OpenCV BGR image array into bytes."""
-        success, buffer = cv2.imencode(format, image)
-        if not success:
-            raise ValueError("Failed to encode frame")
-        return buffer.tobytes()
+    if not success:
+        print("Error: Could not read frame")
+        break
 
+    cv2.imshow("NexHire - Webcam", frame)
 
-opencv_service = OpenCVService()
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
 
-if __name__ == "__main__":
-    print(f"OpenCV Version: {cv2.__version__}")
-    # Create a dummy black image 100x100
-    dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
-    encoded = opencv_service.encode_frame(dummy_img)
-    decoded = opencv_service.decode_frame(encoded)
-    print(f"Test Frame Encoded Size: {len(encoded)} bytes, Decoded Shape: {decoded.shape}")
-    print("OpenCV Service initialized and verified successfully!")
+cap.release()
+cv2.destroyAllWindows()
