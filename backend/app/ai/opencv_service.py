@@ -3,14 +3,13 @@ import cv2
 
 try:
     from app.ai.mediapipe_service import detect_face
+    from app.ai.whisper_service import transcribe_video
 except ImportError:
     from mediapipe_service import detect_face
+    from whisper_service import transcribe_video
 
 
 def run_face_detection():
-    # ============================================================
-    # WEBCAM
-    # ============================================================
 
     cap = cv2.VideoCapture(0)
 
@@ -18,118 +17,94 @@ def run_face_detection():
         print("Error: Could not open webcam")
         return
 
-    print("Starting face landmark detection... Press 'q' to quit.")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # ============================================================
-    # MAIN LOOP
-    # ============================================================
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    video_writer = cv2.VideoWriter(
+        "interview.mp4",
+        fourcc,
+        20.0,
+        (width, height)
+    )
+
+    print("Recording started...")
+    print("Press q to stop.")
 
     try:
-        while True:
 
-            # --------------------------------------------------------
-            # Capture frame
-            # --------------------------------------------------------
+        while True:
 
             success, frame = cap.read()
 
             if not success:
-                print("Error: Could not read frame")
                 break
-
-            # --------------------------------------------------------
-            # Flip webcam horizontally
-            # --------------------------------------------------------
 
             frame = cv2.flip(frame, 1)
 
-            # --------------------------------------------------------
-            # Resize frame
-            # --------------------------------------------------------
+            video_writer.write(frame)
 
-            frame = cv2.resize(
+            resized_frame = cv2.resize(
                 frame,
                 (800, 600)
             )
 
-            # --------------------------------------------------------
-            # Convert BGR → RGB
-            # --------------------------------------------------------
-
             rgb_frame = cv2.cvtColor(
-                frame,
+                resized_frame,
                 cv2.COLOR_BGR2RGB
             )
 
-            # --------------------------------------------------------
-            # Timestamp (in milliseconds)
-            # --------------------------------------------------------
-
             timestamp = int(time.time() * 1000)
-
-            # --------------------------------------------------------
-            # SEND RGB FRAME TO MEDIAPIPE
-            # --------------------------------------------------------
 
             face_landmarks = detect_face(
                 rgb_frame,
                 timestamp
             )
 
-            # ========================================================
-            # DRAW LANDMARKS
-            # ========================================================
-
             if face_landmarks:
 
-                # We only requested one face
                 face = face_landmarks[0]
 
-                h, w, _ = frame.shape
-
-                # ----------------------------------------------------
-                # Draw all landmark points
-                # ----------------------------------------------------
+                h, w, _ = resized_frame.shape
 
                 for landmark in face:
 
                     x = int(landmark.x * w)
                     y = int(landmark.y * h)
 
-                    # Make sure point is inside frame
                     if 0 <= x < w and 0 <= y < h:
 
                         cv2.circle(
-                            frame,
+                            resized_frame,
                             (x, y),
                             1,
                             (0, 255, 0),
                             -1
                         )
 
-            # ========================================================
-            # DISPLAY
-            # ========================================================
-
             cv2.imshow(
                 "NexHire - Face Landmarks",
-                frame
+                resized_frame
             )
-
-            # ========================================================
-            # EXIT
-            # ========================================================
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
     finally:
-        # ============================================================
-        # CLEANUP
-        # ============================================================
 
         cap.release()
+        video_writer.release()
         cv2.destroyAllWindows()
+
+    print("\nGenerating Transcript...\n")
+
+    transcript = transcribe_video(
+        "interview.mp4"
+    )
+
+    print("===== TRANSCRIPT =====\n")
+    print(transcript)
 
 
 if __name__ == "__main__":
