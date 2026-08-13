@@ -80,4 +80,4 @@ if __name__ == "__main__":
     except ImportError:
         from opencv_service import run_face_detection
 
-    run_face_detection()
+    run_face_detection()
