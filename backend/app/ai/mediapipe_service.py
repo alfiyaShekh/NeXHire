@@ -29,16 +29,14 @@ VisionRunningMode = (
 )
 
 
-# ============================================================
-# FACE LANDMARKER OPTIONS
-# ============================================================
+MAX_FACES = 10
 
 options = FaceLandmarkerOptions(
     base_options=BaseOptions(
         model_asset_path=MODEL_PATH
     ),
     running_mode=VisionRunningMode.VIDEO,
-    num_faces=1
+    num_faces=MAX_FACES
 )
 
 
@@ -59,6 +57,10 @@ def detect_face(rgb_frame, timestamp):
     """
     Receive an RGB frame from OpenCV
     and detect facial landmarks using MediaPipe.
+
+    Returns a list of per-face landmark lists (up to MAX_FACES).
+    Candidate identity / tracking logic must NOT live here —
+    see candidate_identity.py and candidate_tracker.py.
     """
 
     mp_image = mp.Image(
