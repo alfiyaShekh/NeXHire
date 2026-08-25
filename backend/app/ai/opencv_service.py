@@ -108,6 +108,8 @@ def ai_worker(
 
     print("AI processing thread started.")
 
+    last_timestamp_ms = 0
+
     while not state.stop.is_set():
 
         # ----------------------------------------------------
@@ -146,6 +148,10 @@ def ai_worker(
         # ====================================================
         # MEDIAPIPE
         # ====================================================
+
+        if timestamp_ms <= last_timestamp_ms:
+            timestamp_ms = last_timestamp_ms + 1
+        last_timestamp_ms = timestamp_ms
 
         try:
 
@@ -467,29 +473,13 @@ def run_face_detection():
                 )
 
             # =================================================
-            # DRAW STATUS
+            # DRAW HUD & GAZE RADAR OVERLAY
             # =================================================
 
-            _draw_status(
+            _draw_hud(
                 display_frame,
-                status
-            )
-
-            # =================================================
-            # DRAW FPS
-            # =================================================
-
-            _draw_fps(
-                display_frame,
-                current_fps
-            )
-
-            # =================================================
-            # DRAW EYE CONTACT
-            # =================================================
-
-            _draw_eye_status(
-                display_frame,
+                status,
+                current_fps,
                 eye_result
             )
 
@@ -551,6 +541,7 @@ def run_face_detection():
                 with state.lock:
 
                     tracker.reset_candidate()
+                    eye_contact.reset_eye_tracking()
 
                     state.latest_status = (
                         CandidateStatus.WAITING_FOR_CANDIDATE
@@ -610,111 +601,274 @@ def run_face_detection():
 # DRAW STATUS
 # ============================================================
 
-def _draw_status(
+# ============================================================
+# DRAW HUD & GAZE RADAR OVERLAY
+# ============================================================
+
+def _draw_hud(
     frame,
-    status
-):
-
-    labels = {
-
-        CandidateStatus.WAITING_FOR_CANDIDATE:
-            "Waiting for candidate",
-
-        CandidateStatus.CANDIDATE_SELECTED:
-            "Candidate selected - Press S",
-
-        CandidateStatus.CANDIDATE_LOCKED:
-            "Candidate locked",
-
-        CandidateStatus.CANDIDATE_PRESENT:
-            "Candidate present",
-
-        CandidateStatus.CANDIDATE_NOT_DETECTED:
-            "Candidate not detected",
-
-        CandidateStatus.DIFFERENT_PERSON_DETECTED:
-            "Different person detected",
-
-        CandidateStatus.MULTIPLE_FACES_DETECTED:
-            "Multiple faces detected",
-
-        CandidateStatus.CANDIDATE_UNCERTAIN:
-            "Candidate uncertain",
-    }
-
-    text = labels.get(
-        status,
-        str(status)
-    )
-
-    cv2.putText(
-        frame,
-        text,
-        (20, 35),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 0),
-        2
-    )
-
-
-# ============================================================
-# DRAW FPS
-# ============================================================
-
-def _draw_fps(
-    frame,
-    fps
-):
-
-    text = f"Camera FPS: {fps:.1f}"
-
-    cv2.putText(
-        frame,
-        text,
-        (20, 65),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 255),
-        2
-    )
-
-
-# ============================================================
-# DRAW EYE CONTACT
-# ============================================================
-
-def _draw_eye_status(
-    frame,
+    status,
+    fps,
     eye_result
 ):
 
+    height, width, _ = frame.shape
+
+    # 1. Overlay semi-transparent dark HUD card (Top Left)
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (12, 12),
+        (375, 225),
+        (16, 18, 24),
+        -1
+    )
+    cv2.addWeighted(
+        overlay,
+        0.82,
+        frame,
+        0.18,
+        0,
+        frame
+    )
+    cv2.rectangle(
+        frame,
+        (12, 12),
+        (375, 225),
+        (60, 68, 85),
+        1
+    )
+
+    # 2. Header Title & FPS
+    cv2.putText(
+        frame,
+        "NexHire AI Monitor",
+        (24, 34),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.52,
+        (240, 240, 240),
+        1
+    )
+    cv2.putText(
+        frame,
+        f"{fps:.1f} FPS",
+        (315, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (140, 220, 160),
+        1
+    )
+
+    # 3. Candidate Status
+    labels = {
+        CandidateStatus.WAITING_FOR_CANDIDATE:
+            ("Waiting for Candidate", (0, 190, 255)),
+        CandidateStatus.CANDIDATE_SELECTED:
+            ("Selected - Press 'S' to Start", (0, 255, 120)),
+        CandidateStatus.CANDIDATE_LOCKED:
+            ("Candidate Locked", (0, 255, 0)),
+        CandidateStatus.CANDIDATE_PRESENT:
+            ("Candidate Present", (0, 255, 0)),
+        CandidateStatus.CANDIDATE_NOT_DETECTED:
+            ("Candidate Not Detected", (0, 0, 255)),
+        CandidateStatus.DIFFERENT_PERSON_DETECTED:
+            ("Unknown Person Detected", (0, 0, 255)),
+        CandidateStatus.MULTIPLE_FACES_DETECTED:
+            ("Multiple Faces Detected", (0, 140, 255)),
+        CandidateStatus.CANDIDATE_UNCERTAIN:
+            ("Candidate Uncertain", (0, 190, 255)),
+    }
+    status_text, status_color = labels.get(
+        status,
+        (str(status), (200, 200, 200))
+    )
+    cv2.putText(
+        frame,
+        f"Status: {status_text}",
+        (24, 56),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        status_color,
+        1
+    )
+
+    # Separator Line
+    cv2.line(
+        frame,
+        (24, 66),
+        (362, 66),
+        (45, 52, 65),
+        1
+    )
+
     if eye_result is None:
+        cv2.putText(
+            frame,
+            "Face Not Tracked...",
+            (24, 98),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (140, 140, 140),
+            1
+        )
+        return
 
-        text = "Eye Contact: --"
-
+    # Color scheme for eye status
+    if eye_result.is_blinking:
+        eye_color = (0, 220, 255)   # Yellow
     elif eye_result.looking_at_screen:
-
-        text = (
-            f"Eye Contact: YES "
-            f"{eye_result.score:.2f}"
-        )
-
+        eye_color = (0, 255, 80)    # Green
     else:
+        eye_color = (0, 80, 255)    # Bright Coral/Red
 
-        text = (
-            f"Eye Contact: NO "
-            f"{eye_result.score:.2f}"
+    # 4. Gaze Direction & Attention
+    cv2.putText(
+        frame,
+        f"GAZE: {eye_result.status.upper()}",
+        (24, 88),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.48,
+        eye_color,
+        1
+    )
+
+    # 5. Confidence Score + Progress Bar
+    conf_pct = int(eye_result.confidence * 100)
+    score_pct = int(eye_result.score * 100)
+    cv2.putText(
+        frame,
+        f"Confidence: {conf_pct}%",
+        (24, 114),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.43,
+        (225, 225, 225),
+        1
+    )
+
+    bar_w = 100
+    bar_h = 7
+    cv2.rectangle(
+        frame,
+        (135, 107),
+        (135 + bar_w, 107 + bar_h),
+        (40, 42, 52),
+        -1
+    )
+    fill_w = int(bar_w * (conf_pct / 100.0))
+    bar_color = (
+        (0, 255, 100)
+        if conf_pct >= 70
+        else (
+            (0, 210, 255)
+            if conf_pct >= 45
+            else (0, 60, 255)
         )
+    )
+    if fill_w > 0:
+        cv2.rectangle(
+            frame,
+            (135, 107),
+            (135 + fill_w, 107 + bar_h),
+            bar_color,
+            -1
+        )
+
+    # 6. Blinks & EAR
+    cv2.putText(
+        frame,
+        f"Blinks: {eye_result.blink_count} ({eye_result.blink_rate_bpm:.1f} BPM)",
+        (24, 140),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.43,
+        (210, 210, 210),
+        1
+    )
+    cv2.putText(
+        frame,
+        f"EAR: {eye_result.ear_avg:.2f} (L: {eye_result.ear_left:.2f}, R: {eye_result.ear_right:.2f})",
+        (24, 164),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.41,
+        (170, 170, 170),
+        1
+    )
+    cv2.putText(
+        frame,
+        f"Focus Centrality: {score_pct}%",
+        (24, 188),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.41,
+        (170, 200, 255),
+        1
+    )
+
+    # 7. Real-Time Visual Gaze Radar Widget (Top-Right of Card)
+    radar_x = 278
+    radar_y = 86
+    radar_size = 78
+    cx = radar_x + radar_size // 2
+    cy = radar_y + radar_size // 2
+
+    # Background box
+    cv2.rectangle(
+        frame,
+        (radar_x, radar_y),
+        (radar_x + radar_size, radar_y + radar_size),
+        (26, 28, 36),
+        -1
+    )
+    cv2.rectangle(
+        frame,
+        (radar_x, radar_y),
+        (radar_x + radar_size, radar_y + radar_size),
+        (65, 72, 88),
+        1
+    )
+
+    # Crosshair grid
+    cv2.line(
+        frame,
+        (radar_x, cy),
+        (radar_x + radar_size, cy),
+        (46, 50, 62),
+        1
+    )
+    cv2.line(
+        frame,
+        (cx, radar_y),
+        (cx, radar_y + radar_size),
+        (46, 50, 62),
+        1
+    )
+
+    # Safe screen attention box (Center Target)
+    target_box = 13
+    cv2.rectangle(
+        frame,
+        (cx - target_box, cy - target_box),
+        (cx + target_box, cy + target_box),
+        (0, 160, 70),
+        1
+    )
+
+    # Gaze dot position mapped from horizontal & vertical ratios
+    dot_x = int(radar_x + eye_result.horizontal_ratio * radar_size)
+    dot_y = int(radar_y + eye_result.vertical_ratio * radar_size)
+    dot_x = max(radar_x + 4, min(radar_x + radar_size - 4, dot_x))
+    dot_y = max(radar_y + 4, min(radar_y + radar_size - 4, dot_y))
+
+    # Draw glowing gaze dot
+    cv2.circle(frame, (dot_x, dot_y), 5, eye_color, -1)
+    cv2.circle(frame, (dot_x, dot_y), 7, (255, 255, 255), 1)
 
     cv2.putText(
         frame,
-        text,
-        (20, 95),
+        "GAZE RADAR",
+        (radar_x + 3, radar_y + radar_size + 14),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 0),
-        2
+        0.33,
+        (135, 140, 155),
+        1
     )
 
 
