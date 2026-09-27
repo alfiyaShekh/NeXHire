@@ -1,373 +1,208 @@
 """
 candidate_identity.py
 
-Handles candidate identity only.
+Owns the decision of WHO the candidate is for this interview session.
+This module is intentionally narrow:
+    - It decides whether/when a candidate may be locked.
+    - It stores a reference "signature" for the locked candidate.
+    - It answers "does this face plausibly match the locked candidate?"
 
-InsightFace is used:
-    1. When the candidate starts the interview.
-    2. When identity must be re-verified after the candidate
-       disappears.
-
-It is NOT intended to run continuously on every webcam frame.
+LIMITATION (by design, stated explicitly per requirements):
+    The signature used here is a normalized facial-geometry descriptor
+    derived from MediaPipe Face Landmarker points (relative distances
+    between stable landmarks, scaled by inter-ocular distance). This is
+    a lightweight heuristic, NOT a trained biometric face-recognition
+    embedding (e.g. FaceNet/ArcFace). Two different people can produce
+    similar geometric ratios, and the same person can drift in the
+    descriptor under extreme pose/expression changes. Geometric
+    similarity alone is therefore never treated as proof of identity —
+    it is only ever used as a heuristic gate, and callers (see
+    candidate_tracker.py) must treat inconclusive matches as
+    "ambiguous", not as confirmed re-identification. For production-
+    grade re-acquisition after long absences, integrate a real face
+    recognition model; this module deliberately does not claim to
+    provide that.
 """
 
-from typing import Optional
+import logging
+import time
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
-from insightface.app import FaceAnalysis
+
+from mediapipe_service import FaceResult, FrameResult, Landmark
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Stable landmark indices (MediaPipe Face Landmarker / 478-point mesh):
+# left eye outer, right eye outer, left eye inner, right eye inner,
+# nose tip, left mouth corner, right mouth corner, chin.
+_SIGNATURE_LANDMARK_INDICES: Tuple[int, ...] = (33, 263, 133, 362, 1, 61, 291, 152)
+_LEFT_EYE_OUTER = 33
+_RIGHT_EYE_OUTER = 263
 
 
-# ============================================================
-# SETTINGS
-# ============================================================
-
-IDENTITY_MATCH_THRESHOLD = 0.60
-
-MIN_FACE_BOX_SIDE_PX = 60
-
-INSIGHTFACE_DET_SIZE = (320, 320)
+class IdentityError(Exception):
+    """Raised on invalid identity operations (e.g. lock with bad state)."""
 
 
-# ============================================================
-# MODEL
-# ============================================================
-
-_identity_app = None
-
-
-def _get_identity_app():
-
-    global _identity_app
-
-    if _identity_app is None:
-
-        print("Loading InsightFace identity model...")
-
-        _identity_app = FaceAnalysis(
-            name="buffalo_l",
-            providers=["CPUExecutionProvider"]
-        )
-
-        _identity_app.prepare(
-            ctx_id=-1,
-            det_size=INSIGHTFACE_DET_SIZE
-        )
-
-        print("InsightFace identity model loaded.")
-
-    return _identity_app
+@dataclass
+class MatchResult:
+    """Result of comparing a live face against the locked reference."""
+    distance: float          # lower = more similar (geometric heuristic only)
+    is_match: bool           # distance below threshold
+    is_biometric_proof: bool = False  # always False here; see module docstring
 
 
-# ============================================================
-# CANDIDATE IDENTITY
-# ============================================================
+class CandidateIdentityManager:
+    """
+    Tracks the "who" for a single interview session.
 
-class CandidateIdentity:
+    Usage:
+        identity = CandidateIdentityManager()
+        if identity.try_lock(frame_result):
+            ...  # locked
+        match = identity.match(some_face_result)
+    """
 
-    def __init__(
-        self,
-        embedding: np.ndarray
-    ):
+    def __init__(self, match_distance_threshold: float = 0.18) -> None:
+        self.match_distance_threshold = match_distance_threshold
 
-        self.embedding = normalize_embedding(
-            embedding
-        )
+        self._locked: bool = False
+        self._reference_descriptor: Optional[np.ndarray] = None
+        self._reference_landmarks: Optional[List[Landmark]] = None
+        self._locked_frame_id: Optional[int] = None
+        self._locked_at_ts: Optional[float] = None
 
-    @classmethod
-    def from_frame(
-        cls,
-        rgb_frame: np.ndarray,
-        face_landmarks
-    ) -> Optional["CandidateIdentity"]:
+    # ------------------------------------------------------------------ #
+    # Locking
+    # ------------------------------------------------------------------ #
+    @property
+    def is_locked(self) -> bool:
+        return self._locked
 
-        embedding = generate_embedding(
-            rgb_frame,
-            face_landmarks
-        )
+    def try_lock(self, frame_result: FrameResult) -> bool:
+        """
+        Attempt to lock the candidate identity.
 
-        if embedding is None:
-            return None
-
-        return cls(
-            embedding
-        )
-
-    def matches(
-        self,
-        embedding: Optional[np.ndarray]
-    ) -> bool:
-
-        if embedding is None:
+        Locking is only permitted when exactly one face is visible
+        (requirement: never select randomly among multiple faces).
+        Returns True if locking succeeded, False otherwise. Does
+        nothing if already locked (call reset() first to re-lock).
+        """
+        if self._locked:
+            logger.info("Lock requested but identity is already locked. Ignoring.")
             return False
 
-        similarity = compare_embeddings(
-            self.embedding,
-            embedding
-        )
+        if frame_result.num_faces == 0:
+            logger.info("Lock rejected: no face visible.")
+            return False
 
-        return similarity >= IDENTITY_MATCH_THRESHOLD
+        if frame_result.num_faces > 1:
+            logger.info(
+                "Lock rejected: %d faces visible; exactly one is required to lock.",
+                frame_result.num_faces,
+            )
+            return False
 
-    def similarity(
-        self,
-        embedding: Optional[np.ndarray]
-    ) -> float:
+        face = frame_result.faces[0]
+        descriptor = self.compute_descriptor(face.landmarks)
+        if descriptor is None:
+            logger.warning("Lock rejected: could not compute descriptor from landmarks.")
+            return False
 
-        if embedding is None:
-            return 0.0
+        self._reference_descriptor = descriptor
+        self._reference_landmarks = face.landmarks
+        self._locked_frame_id = frame_result.frame_id
+        self._locked_at_ts = time.time()
+        self._locked = True
 
-        return compare_embeddings(
-            self.embedding,
-            embedding
-        )
+        logger.info("Candidate locked at frame_id=%s.", frame_result.frame_id)
+        return True
 
+    def reset(self) -> None:
+        """
+        Explicitly clear the locked identity. Must only be called on
+        deliberate request or when a new interview session begins —
+        never automatically by tracking logic.
+        """
+        self._locked = False
+        self._reference_descriptor = None
+        self._reference_landmarks = None
+        self._locked_frame_id = None
+        self._locked_at_ts = None
+        logger.info("Candidate identity reset.")
 
-# ============================================================
-# MEDIAPIPE LANDMARKS → BOX
-# ============================================================
+    @property
+    def reference_landmarks(self) -> Optional[List[Landmark]]:
+        return self._reference_landmarks
 
-def _landmarks_to_face_box(
-    rgb_frame,
-    face_landmarks
-):
+    # ------------------------------------------------------------------ #
+    # Matching (heuristic only — see module docstring)
+    # ------------------------------------------------------------------ #
+    def match(self, face: FaceResult) -> MatchResult:
+        """
+        Compare a candidate face against the locked reference.
 
-    if not face_landmarks:
-        return None
+        Returns a MatchResult with a heuristic distance. This is NOT
+        biometric verification (see module docstring) — callers must
+        treat close/borderline distances as ambiguous rather than as
+        confirmed identity.
+        """
+        if not self._locked or self._reference_descriptor is None:
+            raise IdentityError("Cannot match: no candidate is locked.")
 
-    h, w, _ = rgb_frame.shape
+        descriptor = self.compute_descriptor(face.landmarks)
+        if descriptor is None:
+            return MatchResult(distance=float("inf"), is_match=False)
 
-    xs = [
-        lm.x
-        for lm in face_landmarks
-    ]
+        distance = float(np.linalg.norm(descriptor - self._reference_descriptor))
+        is_match = distance <= self.match_distance_threshold
+        return MatchResult(distance=distance, is_match=is_match)
 
-    ys = [
-        lm.y
-        for lm in face_landmarks
-    ]
-
-    if not xs or not ys:
-        return None
-
-    left = max(
-        int(min(xs) * w),
-        0
-    )
-
-    right = min(
-        int(max(xs) * w),
-        w - 1
-    )
-
-    top = max(
-        int(min(ys) * h),
-        0
-    )
-
-    bottom = min(
-        int(max(ys) * h),
-        h - 1
-    )
-
-    if right <= left or bottom <= top:
-        return None
-
-    return (
-        left,
-        top,
-        right,
-        bottom
-    )
-
-
-# ============================================================
-# FIND CORRESPONDING INSIGHTFACE FACE
-# ============================================================
-
-def _find_matching_face(
-    rgb_frame,
-    face_landmarks,
-    insight_faces
-):
-
-    target_box = _landmarks_to_face_box(
-        rgb_frame,
-        face_landmarks
-    )
-
-    if target_box is None:
-        return None
-
-    tx1, ty1, tx2, ty2 = target_box
-
-    target_cx = (
-        tx1 + tx2
-    ) / 2
-
-    target_cy = (
-        ty1 + ty2
-    ) / 2
-
-    target_size = max(
-        tx2 - tx1,
-        ty2 - ty1,
-        1
-    )
-
-    best_face = None
-    best_distance = float("inf")
-
-    for face in insight_faces:
-
-        bbox = face.bbox
-
-        fx1 = float(bbox[0])
-        fy1 = float(bbox[1])
-        fx2 = float(bbox[2])
-        fy2 = float(bbox[3])
-
-        face_cx = (
-            fx1 + fx2
-        ) / 2
-
-        face_cy = (
-            fy1 + fy2
-        ) / 2
-
-        distance = (
-            (
-                target_cx - face_cx
-            ) ** 2
-            +
-            (
-                target_cy - face_cy
-            ) ** 2
-        ) ** 0.5
-
-        normalized_distance = (
-            distance / target_size
-        )
-
-        if normalized_distance < best_distance:
-
-            best_distance = normalized_distance
-            best_face = face
-
-    return best_face
-
-
-# ============================================================
-# GENERATE EMBEDDING
-# ============================================================
-
-def generate_embedding(
-    rgb_frame: np.ndarray,
-    face_landmarks
-) -> Optional[np.ndarray]:
-
-    if not face_landmarks:
-        return None
-
-    box = _landmarks_to_face_box(
-        rgb_frame,
-        face_landmarks
-    )
-
-    if box is None:
-        return None
-
-    left, top, right, bottom = box
-
-    if (
-        right - left < MIN_FACE_BOX_SIDE_PX
-        or
-        bottom - top < MIN_FACE_BOX_SIDE_PX
-    ):
-        return None
-
-    try:
-
-        app = _get_identity_app()
-
-        faces = app.get(
-            rgb_frame
-        )
-
-        if not faces:
+    # ------------------------------------------------------------------ #
+    # Geometric descriptor helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def compute_descriptor(landmarks: Sequence[Landmark]) -> Optional[np.ndarray]:
+        """
+        Build a scale-normalized geometric signature from a fixed set
+        of stable landmarks: pairwise distances among them, divided by
+        inter-ocular distance. Heuristic only — see module docstring.
+        """
+        if not landmarks:
             return None
 
-        matched_face = _find_matching_face(
-            rgb_frame,
-            face_landmarks,
-            faces
-        )
-
-        if matched_face is None:
+        try:
+            points = {
+                idx: np.array([landmarks[idx].x, landmarks[idx].y])
+                for idx in _SIGNATURE_LANDMARK_INDICES
+            }
+        except IndexError:
+            logger.warning("Landmark set too small to compute descriptor.")
             return None
 
-        embedding = (
-            matched_face.normed_embedding
-        )
-
-        if embedding is None:
+        inter_ocular = np.linalg.norm(points[_LEFT_EYE_OUTER] - points[_RIGHT_EYE_OUTER])
+        if inter_ocular < 1e-6:
+            logger.warning("Degenerate inter-ocular distance; cannot normalize descriptor.")
             return None
 
-        return normalize_embedding(
-            embedding
-        )
+        distances = []
+        indices = _SIGNATURE_LANDMARK_INDICES
+        for i in range(len(indices)):
+            for j in range(i + 1, len(indices)):
+                d = np.linalg.norm(points[indices[i]] - points[indices[j]])
+                distances.append(d / inter_ocular)
 
-    except Exception as error:
+        return np.array(distances, dtype=np.float32)
 
-        print(
-            "Identity verification error:",
-            error
-        )
-
-        return None
-
-
-# ============================================================
-# NORMALIZE
-# ============================================================
-
-def normalize_embedding(
-    embedding
-):
-
-    embedding = np.asarray(
-        embedding,
-        dtype=np.float32
-    )
-
-    norm = np.linalg.norm(
-        embedding
-    )
-
-    if norm == 0:
-        return embedding
-
-    return embedding / norm
-
-
-# ============================================================
-# COMPARE
-# ============================================================
-
-def compare_embeddings(
-    reference,
-    candidate
-):
-
-    reference = normalize_embedding(
-        reference
-    )
-
-    candidate = normalize_embedding(
-        candidate
-    )
-
-    return float(
-        np.dot(
-            reference,
-            candidate
-        )
-    )
+    @staticmethod
+    def compute_centroid(landmarks: Sequence[Landmark]) -> Optional[Tuple[float, float]]:
+        """Mean (x, y) of all landmarks — used by the tracker for spatial continuity."""
+        if not landmarks:
+            return None
+        xs = [lm.x for lm in landmarks]
+        ys = [lm.y for lm in landmarks]
+        return (sum(xs) / len(xs), sum(ys) / len(ys))

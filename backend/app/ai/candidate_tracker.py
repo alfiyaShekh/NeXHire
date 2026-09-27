@@ -1,440 +1,238 @@
 """
 candidate_tracker.py
 
-Maintains the locked candidate throughout the interview.
+Consumes FrameResult objects from mediapipe_service.py and uses
+CandidateIdentityManager (candidate_identity.py) to report per-frame
+tracking status for the LOCKED candidate only.
 
-Important rule:
+Separation of concerns:
+    - candidate_identity.py decides WHO is locked and whether a face
+      plausibly matches that reference (a geometric heuristic).
+    - candidate_tracker.py decides, frame over frame, whether the
+      locked candidate is currently visible, temporarily missing,
+      lost, or ambiguous — and never substitutes a different visible
+      person for the locked candidate.
 
-Once a candidate is locked, no other person can replace them.
-
-Identity verification is performed only:
-    - when starting the interview
-    - when the candidate returns after being absent
-    - when the system explicitly needs to verify identity
-
-Normal movement is handled by MediaPipe landmarks only.
+This module does NOT perform biometric identity verification; see
+candidate_identity.py's module docstring for that limitation.
 """
 
-from enum import Enum, auto
-from typing import List, Optional, Tuple
+import logging
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional
 
-from app.ai import candidate_identity as identity_module
+from candidate_identity import CandidateIdentityManager, IdentityError
+from mediapipe_service import FaceResult, FrameResult, Landmark
 
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-MISSED_FRAME_TOLERANCE = 3
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-class CandidateStatus(Enum):
-
-    WAITING_FOR_CANDIDATE = auto()
-
-    CANDIDATE_SELECTED = auto()
-
-    CANDIDATE_LOCKED = auto()
-
-    CANDIDATE_PRESENT = auto()
-
-    CANDIDATE_NOT_DETECTED = auto()
-
-    DIFFERENT_PERSON_DETECTED = auto()
-
-    MULTIPLE_FACES_DETECTED = auto()
-
-    CANDIDATE_UNCERTAIN = auto()
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
-# ============================================================
-# TRACKER
-# ============================================================
+class TrackingStatus(str, Enum):
+    NOT_LOCKED = "not_locked"          # no candidate locked yet
+    TRACKING = "tracking"              # locked candidate confidently found this frame
+    REACQUIRING = "reacquiring"        # locked candidate missing, within grace period
+    AMBIGUOUS = "ambiguous"            # match inconclusive (e.g. crossing/overlap)
+    CANDIDATE_LOST = "candidate_lost"  # grace period expired; identity NOT reset
+
+
+@dataclass
+class TrackerResult:
+    candidate_locked: bool
+    candidate_found: bool
+    candidate_lost: bool
+    multiple_faces: bool
+    face_count: int
+    tracking_status: TrackingStatus
+    locked_candidate_landmarks: Optional[List[Landmark]]
+
 
 class CandidateTracker:
+    """
+    Usage:
+        identity = CandidateIdentityManager()
+        tracker = CandidateTracker(identity, grace_period_ms=5000)
+
+        # once, when exactly one face is visible:
+        tracker.request_lock(frame_result)
+
+        # every frame:
+        result = tracker.process(frame_result)
+    """
 
     def __init__(
         self,
-        identity_backend=identity_module
-    ):
+        identity_manager: CandidateIdentityManager,
+        grace_period_ms: float = 5000.0,
+    ) -> None:
+        self.identity = identity_manager
+        self.grace_period_ms = grace_period_ms
 
-        self._identity_backend = identity_backend
+        self._missing_since_ms: Optional[float] = None
+        self._last_confirmed_landmarks: Optional[List[Landmark]] = None
 
-        self.reset_candidate()
+    # ------------------------------------------------------------------ #
+    # Public control
+    # ------------------------------------------------------------------ #
+    def request_lock(self, frame_result: FrameResult) -> bool:
+        """Attempt to lock the candidate (delegates rules to identity manager)."""
+        locked = self.identity.try_lock(frame_result)
+        if locked:
+            self._missing_since_ms = None
+            self._last_confirmed_landmarks = self.identity.reference_landmarks
+        return locked
 
-    # ========================================================
-    # RESET
-    # ========================================================
+    def reset(self) -> None:
+        """
+        Explicitly reset tracker + identity state. Only call this on
+        deliberate user request or when a brand-new interview session
+        begins — never automatically from tracking logic.
+        """
+        self.identity.reset()
+        self._missing_since_ms = None
+        self._last_confirmed_landmarks = None
+        logger.info("Tracker reset.")
 
-    def reset_candidate(self):
+    # ------------------------------------------------------------------ #
+    # Per-frame processing
+    # ------------------------------------------------------------------ #
+    def process(self, frame_result: FrameResult) -> TrackerResult:
+        face_count = frame_result.num_faces
+        multiple_faces = face_count > 1
 
-        self.status = (
-            CandidateStatus.WAITING_FOR_CANDIDATE
-        )
-
-        self.locked_identity = None
-
-        self.interview_started = False
-
-        self._pending_candidate_landmarks = None
-
-        self._candidate_was_present = False
-
-        self._consecutive_missed_frames = 0
-
-        # When True, the next visible face MUST be
-        # identity verified.
-        self._identity_verification_required = False
-
-    # ========================================================
-    # START INTERVIEW
-    # ========================================================
-
-    def start_interview(
-        self,
-        rgb_frame
-    ):
-
-        if self.status != (
-            CandidateStatus.CANDIDATE_SELECTED
-        ):
-
-            raise RuntimeError(
-                "Cannot start interview. "
-                "Exactly one candidate must be selected."
+        if not self.identity.is_locked:
+            return TrackerResult(
+                candidate_locked=False,
+                candidate_found=False,
+                candidate_lost=False,
+                multiple_faces=multiple_faces,
+                face_count=face_count,
+                tracking_status=TrackingStatus.NOT_LOCKED,
+                locked_candidate_landmarks=None,
             )
 
-        if self._pending_candidate_landmarks is None:
+        matches = self._match_all(frame_result.faces)
+        matched_faces = [f for f, m in matches if m.is_match]
 
-            raise RuntimeError(
-                "Candidate landmarks are unavailable."
+        if len(matched_faces) == 1:
+            # Exactly one plausible match: confirmed for this frame.
+            self._missing_since_ms = None
+            self._last_confirmed_landmarks = matched_faces[0].landmarks
+            return TrackerResult(
+                candidate_locked=True,
+                candidate_found=True,
+                candidate_lost=False,
+                multiple_faces=multiple_faces,
+                face_count=face_count,
+                tracking_status=TrackingStatus.TRACKING,
+                locked_candidate_landmarks=matched_faces[0].landmarks,
             )
 
-        # ----------------------------------------------------
-        # CREATE IDENTITY ONCE
-        # ----------------------------------------------------
+        # Not a single confident match this frame: either nobody
+        # matched (0) or the match was inconclusive (>1). Never pick
+        # one arbitrarily — start/continue the missing-time counter.
+        if self._missing_since_ms is None:
+            self._missing_since_ms = frame_result.timestamp_ms
+        elapsed_ms = frame_result.timestamp_ms - self._missing_since_ms
 
-        identity = (
-            self._identity_backend
-            .CandidateIdentity
-            .from_frame(
-                rgb_frame,
-                self._pending_candidate_landmarks
-            )
-        )
-
-        if identity is None:
-
-            self.status = (
-                CandidateStatus.CANDIDATE_UNCERTAIN
-            )
-
-            raise RuntimeError(
-                "Could not create candidate identity. "
-                "Please face the camera clearly."
-            )
-
-        # ----------------------------------------------------
-        # LOCK CANDIDATE
-        # ----------------------------------------------------
-
-        self.locked_identity = identity
-
-        self.interview_started = True
-
-        self._candidate_was_present = True
-
-        self._identity_verification_required = False
-
-        self._consecutive_missed_frames = 0
-
-        self.status = (
-            CandidateStatus.CANDIDATE_LOCKED
-        )
-
-        print(
-            "Candidate identity locked."
-        )
-
-        return self.status
-
-    # ========================================================
-    # PROCESS FRAME
-    # ========================================================
-
-    def process_frame(
-        self,
-        rgb_frame,
-        all_face_landmarks: List
-    ) -> Tuple[
-        CandidateStatus,
-        Optional[object]
-    ]:
-
-        if not self.interview_started:
-
-            return self._process_pre_interview(
-                all_face_landmarks
+        if len(matched_faces) > 1:
+            # Ambiguous: more than one face plausibly resembles the
+            # reference (e.g. two people crossing). Preserve identity,
+            # report ambiguity, do not switch.
+            status = TrackingStatus.AMBIGUOUS
+            if elapsed_ms > self.grace_period_ms:
+                status = TrackingStatus.CANDIDATE_LOST
+            return TrackerResult(
+                candidate_locked=True,
+                candidate_found=False,
+                candidate_lost=(status == TrackingStatus.CANDIDATE_LOST),
+                multiple_faces=multiple_faces,
+                face_count=face_count,
+                tracking_status=status,
+                locked_candidate_landmarks=(
+                    None if status == TrackingStatus.CANDIDATE_LOST
+                    else self._last_confirmed_landmarks
+                ),
             )
 
-        return self._process_post_interview(
-            rgb_frame,
-            all_face_landmarks
-        )
-
-    # ========================================================
-    # PRE-INTERVIEW
-    # ========================================================
-
-    def _process_pre_interview(
-        self,
-        all_face_landmarks
-    ):
-
-        count = len(
-            all_face_landmarks
-        )
-
-        if count == 0:
-
-            self.status = (
-                CandidateStatus.CANDIDATE_NOT_DETECTED
+        # No matches at all this frame (candidate not visible, or a
+        # different, unmatched person is present).
+        if elapsed_ms <= self.grace_period_ms:
+            return TrackerResult(
+                candidate_locked=True,
+                candidate_found=False,
+                candidate_lost=False,
+                multiple_faces=multiple_faces,
+                face_count=face_count,
+                tracking_status=TrackingStatus.REACQUIRING,
+                locked_candidate_landmarks=self._last_confirmed_landmarks,
             )
 
-            self._pending_candidate_landmarks = None
-
-            return self.status, None
-
-        if count >= 2:
-
-            self.status = (
-                CandidateStatus.MULTIPLE_FACES_DETECTED
-            )
-
-            self._pending_candidate_landmarks = None
-
-            return self.status, None
-
-        # Exactly one face.
-
-        self._pending_candidate_landmarks = (
-            all_face_landmarks[0]
+        # Grace period expired: report loss WITHOUT resetting identity.
+        return TrackerResult(
+            candidate_locked=True,
+            candidate_found=False,
+            candidate_lost=True,
+            multiple_faces=multiple_faces,
+            face_count=face_count,
+            tracking_status=TrackingStatus.CANDIDATE_LOST,
+            locked_candidate_landmarks=None,
         )
 
-        self.status = (
-            CandidateStatus.CANDIDATE_SELECTED
-        )
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+    def _match_all(self, faces: List[FaceResult]):
+        """Return [(face, MatchResult), ...] for every visible face, safely."""
+        results = []
+        for face in faces:
+            try:
+                results.append((face, self.identity.match(face)))
+            except IdentityError:
+                # Should not happen once locked, but never crash the
+                # tracking loop over an identity-layer error.
+                logger.error("Identity match failed unexpectedly for a visible face.")
+        return results
 
-        return (
-            self.status,
-            self._pending_candidate_landmarks
-        )
 
-    # ========================================================
-    # AFTER INTERVIEW
-    # ========================================================
+# ---------------------------------------------------------------------- #
+# Manual test / demo
+# ---------------------------------------------------------------------- #
+if __name__ == "__main__":
+    import cv2
 
-    def _process_post_interview(
-        self,
-        rgb_frame,
-        all_face_landmarks
-    ):
+    from opencv_service import CameraError, OpenCVService
+    from mediapipe_service import FaceLandmarkerError, MediaPipeService
 
-        if self.locked_identity is None:
+    identity = CandidateIdentityManager()
+    tracker = CandidateTracker(identity, grace_period_ms=5000)
 
-            raise RuntimeError(
-                "Interview started without locked identity."
-            )
+    try:
+        with OpenCVService(camera_index=0) as cam, MediaPipeService(
+            model_path="models/face_landmarker.task", running_mode="VIDEO"
+        ) as face_service:
+            for frame_data in cam.stream():
+                frame_result = face_service.process(frame_data.frame, frame_data.frame_id)
 
-        # ----------------------------------------------------
-        # NO FACE
-        # ----------------------------------------------------
+                if not identity.is_locked:
+                    tracker.request_lock(frame_result)
 
-        if len(all_face_landmarks) == 0:
-
-            self._consecutive_missed_frames += 1
-
-            self._candidate_was_present = False
-
-            # The next person who appears MUST be verified.
-
-            self._identity_verification_required = True
-
-            if (
-                self._consecutive_missed_frames
-                >= MISSED_FRAME_TOLERANCE
-            ):
-
-                self.status = (
-                    CandidateStatus.CANDIDATE_NOT_DETECTED
+                result = tracker.process(frame_result)
+                logger.info(
+                    "status=%s locked=%s found=%s lost=%s faces=%d multi=%s",
+                    result.tracking_status.value,
+                    result.candidate_locked,
+                    result.candidate_found,
+                    result.candidate_lost,
+                    result.face_count,
+                    result.multiple_faces,
                 )
 
-            return self.status, None
-
-        # ----------------------------------------------------
-        # MULTIPLE FACES
-        # ----------------------------------------------------
-
-        if len(all_face_landmarks) >= 2:
-
-            candidate_landmarks = (
-                self._verify_faces(
-                    rgb_frame,
-                    all_face_landmarks
-                )
-            )
-
-            if candidate_landmarks is not None:
-
-                self._candidate_was_present = True
-
-                self._identity_verification_required = False
-
-                self._consecutive_missed_frames = 0
-
-                self.status = (
-                    CandidateStatus.CANDIDATE_PRESENT
-                )
-
-                return (
-                    self.status,
-                    candidate_landmarks
-                )
-
-            self._candidate_was_present = False
-
-            self._identity_verification_required = True
-
-            self.status = (
-                CandidateStatus.MULTIPLE_FACES_DETECTED
-            )
-
-            return self.status, None
-
-        # ----------------------------------------------------
-        # EXACTLY ONE FACE
-        # ----------------------------------------------------
-
-        face = all_face_landmarks[0]
-
-        # ----------------------------------------------------
-        # VERIFY ONLY WHEN REQUIRED
-        # ----------------------------------------------------
-
-        if self._identity_verification_required:
-
-            embedding = (
-                self._identity_backend
-                .generate_embedding(
-                    rgb_frame,
-                    face
-                )
-            )
-
-            if embedding is None:
-
-                self.status = (
-                    CandidateStatus.CANDIDATE_UNCERTAIN
-                )
-
-                return self.status, None
-
-            # -----------------------------------------------
-            # ORIGINAL CANDIDATE?
-            # -----------------------------------------------
-
-            if self.locked_identity.matches(
-                embedding
-            ):
-
-                self._candidate_was_present = True
-
-                self._identity_verification_required = False
-
-                self._consecutive_missed_frames = 0
-
-                self.status = (
-                    CandidateStatus.CANDIDATE_PRESENT
-                )
-
-                print(
-                    "Original candidate verified."
-                )
-
-                return (
-                    self.status,
-                    face
-                )
-
-            # -----------------------------------------------
-            # DIFFERENT PERSON
-            # -----------------------------------------------
-
-            self._candidate_was_present = False
-
-            self._identity_verification_required = True
-
-            self.status = (
-                CandidateStatus.DIFFERENT_PERSON_DETECTED
-            )
-
-            # NEVER pass B's landmarks downstream.
-
-            return self.status, None
-
-        # ----------------------------------------------------
-        # FAST PATH
-        #
-        # Candidate has already been verified and has not
-        # disappeared.
-        #
-        # NO INSIGHTFACE HERE.
-        # ----------------------------------------------------
-
-        self._candidate_was_present = True
-
-        self._consecutive_missed_frames = 0
-
-        self.status = (
-            CandidateStatus.CANDIDATE_PRESENT
-        )
-
-        return (
-            self.status,
-            face
-        )
-
-    # ========================================================
-    # VERIFY MULTIPLE FACES
-    # ========================================================
-
-    def _verify_faces(
-        self,
-        rgb_frame,
-        all_face_landmarks
-    ):
-
-        for face in all_face_landmarks:
-
-            embedding = (
-                self._identity_backend
-                .generate_embedding(
-                    rgb_frame,
-                    face
-                )
-            )
-
-            if embedding is None:
-                continue
-
-            if self.locked_identity.matches(
-                embedding
-            ):
-
-                return face
-
-        return None
+                cv2.imshow("NexHire - Candidate Tracker Test", frame_data.frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+    except (CameraError, FaceLandmarkerError) as e:
+        logger.error("Error: %s", e)
+    finally:
+        cv2.destroyAllWindows()

@@ -1,439 +1,263 @@
 """
 eye_contact.py
 
-Advanced Eye Contact, Gaze Direction, Blink Detection, and Confidence Analysis
-for the NexHire AI Interview Platform.
+Analyzes eye contact / gaze / blink state for the LOCKED CANDIDATE only.
 
-Key Features:
-- Coordinate-Invariant 3D Iris Landmark Tracking (Left: 468, Right: 473)
-- Accurate Left / Right / Up / Down / Center Gaze Direction Detection
-- 6-Point Eye Aspect Ratio (EAR) for both eyes
-- Debounced Blink Detector with Real-Time Blinks Per Minute (BPM)
-- Dynamic Multi-factor Confidence Score & Focus Centrality
-- Exponential Moving Average (EMA) smoothing for rock-solid stability
+Input contract: this module consumes a candidate_tracker.TrackerResult
+(NOT a raw FrameResult), so face selection is entirely delegated to
+candidate_tracker.py / candidate_identity.py. This module never looks
+at frame_result.faces directly and never picks a face on its own.
+
+LIMITATION (stated explicitly, per requirements):
+    Gaze/eye-contact here is estimated from 2D facial landmarks (eye
+    contour + iris position) with no camera calibration, no 3D eyeball
+    model, and no head-pose compensation. It is a useful signal, not
+    ground-truth gaze tracking — e.g. it can be fooled by head tilt or
+    unusual lighting/occlusion. It should be combined with head_pose.py
+    and, later, liveness_detector.py rather than trusted in isolation.
 """
 
-import time
+import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Deque, List, Optional, Sequence
 
+from candidate_tracker import TrackerResult, TrackingStatus
+from mediapipe_service import Landmark
 
-# ============================================================
-# MEDIAPIPE FACE MESH INDICES (478 LANDMARKS MODEL)
-# ============================================================
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Left eye 6-point EAR contour
-# [outer_corner, upper_1, upper_2, inner_corner, lower_2, lower_1]
-LEFT_EYE_CONTOUR = [33, 160, 158, 133, 153, 144]
+# Standard MediaPipe face-mesh eye landmark indices.
+# 6-point sets follow the classic EAR (Eye Aspect Ratio) layout:
+# [outer_corner, top_1, top_2, inner_corner, bottom_1, bottom_2]
+_LEFT_EYE_EAR_IDX = (33, 160, 158, 133, 153, 144)
+_RIGHT_EYE_EAR_IDX = (263, 385, 387, 362, 380, 373)
 
-# Right eye 6-point EAR contour
-RIGHT_EYE_CONTOUR = [263, 385, 387, 362, 373, 380]
+# Iris landmarks are present because face_landmarker.task outputs the
+# full 478-point mesh (468 mesh points + 10 iris points).
+_LEFT_IRIS_CENTER_IDX = 468
+_RIGHT_IRIS_CENTER_IDX = 473
 
-# Iris landmarks
-LEFT_IRIS_CENTER = 468
-RIGHT_IRIS_CENTER = 473
+# Horizontal eye corners (outer, inner) reused for gaze ratio.
+_LEFT_EYE_H_IDX = (33, 133)
+_RIGHT_EYE_H_IDX = (263, 362)
+# Vertical eyelid landmarks (top, bottom) reused for gaze ratio.
+_LEFT_EYE_V_IDX = (159, 145)
+_RIGHT_EYE_V_IDX = (386, 374)
 
-# Upper and Lower Eyelid Center for vertical gaze
-LEFT_EYE_TOP = 159
-LEFT_EYE_BOTTOM = 145
-RIGHT_EYE_TOP = 386
-RIGHT_EYE_BOTTOM = 374
+_MAX_LANDMARK_INDEX = 477  # highest index we ever access
 
-# Eye corners
-LEFT_EYE_INNER = 133
-LEFT_EYE_OUTER = 33
-RIGHT_EYE_INNER = 362
-RIGHT_EYE_OUTER = 263
-
-
-# ============================================================
-# CALIBRATED THRESHOLDS & BOUNDS
-# ============================================================
-
-# Eye Aspect Ratio threshold for blink detection
-EAR_BLINK_THRESHOLD = 0.19
-
-# Frame counts for blink vs prolonged closure
-MIN_BLINK_FRAMES = 1
-MAX_BLINK_FRAMES = 16  # ~500ms at 30fps
-
-# Gaze ratio bounds (Iris position in eye frame)
-# Normalized from 0.0 (far left) to 1.0 (far right)
-H_RATIO_LEFT_THRESH = 0.42    # < 0.42 means looking left
-H_RATIO_RIGHT_THRESH = 0.58   # > 0.58 means looking right
-
-# Normalized from 0.0 (top) to 1.0 (bottom)
-V_RATIO_UP_THRESH = 0.38      # < 0.38 means looking up
-V_RATIO_DOWN_THRESH = 0.62    # > 0.62 means looking down
-
-# Smoothing factor for Exponential Moving Average (0 < alpha <= 1)
-SMOOTHING_ALPHA = 0.40
-
-
-# ============================================================
-# RESULT DATA STRUCTURE
-# ============================================================
 
 @dataclass
 class EyeContactResult:
+    eye_contact: Optional[bool]
+    gaze_direction: Optional[str]   # "center" | "left" | "right" | "up" | "down" | None
+    blink_detected: bool
+    eyes_open: Optional[bool]
+    confidence: float               # 0.0 (unavailable) .. ~0.85 (heuristic ceiling)
+    status: str                     # mirrors TrackingStatus, or "insufficient_landmarks"
+
+
+class EyeContactAnalyzer:
     """
-    Structured outcome of the eye contact and gaze analysis.
-    """
-    looking_at_screen: bool
-    score: float                # 0.0 to 1.0 (Gaze focus centrality)
-    confidence: float           # 0.0 to 1.0 (Multi-factor overall confidence)
-    status: str                 # Human readable status description
-    gaze_direction: str         # "CENTER", "LEFT", "RIGHT", "UP", "DOWN", "UP-LEFT", "UP-RIGHT", "DOWN-LEFT", "DOWN-RIGHT", "BLINK", "EYES_CLOSED"
-    blink_count: int            # Total blinks detected
-    blink_rate_bpm: float       # Blinks per minute (rolling 60s)
-    ear_avg: float              # Average EAR
-    ear_left: float             # Left eye EAR
-    ear_right: float            # Right eye EAR
-    horizontal_ratio: float     # 0.0 (left) to 1.0 (right), 0.5 = center
-    vertical_ratio: float       # 0.0 (top) to 1.0 (bottom), 0.5 = center
-    is_blinking: bool           # True if eyes are currently closed
-
-    def __repr__(self) -> str:
-        return (
-            f"EyeContactResult("
-            f"looking_at_screen={self.looking_at_screen}, "
-            f"gaze='{self.gaze_direction}', "
-            f"score={self.score:.2f}, "
-            f"confidence={self.confidence:.2f}, "
-            f"blinks={self.blink_count}, "
-            f"bpm={self.blink_rate_bpm:.1f}, "
-            f"status='{self.status}')"
-        )
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def _distance_2d(p1, p2) -> float:
-    """Calculate 2D Euclidean distance between two MediaPipe landmarks."""
-    dx = p1.x - p2.x
-    dy = p1.y - p2.y
-    return (dx * dx + dy * dy) ** 0.5
-
-
-def _calculate_ear(landmarks, contour_indices: List[int]) -> float:
-    """
-    Compute Eye Aspect Ratio (EAR) using standard 6-point formulation:
-    EAR = (|p2 - p6| + |p3 - p5|) / (2 * |p1 - p4|)
-    """
-    try:
-        p1 = landmarks[contour_indices[0]]  # Corner 1
-        p2 = landmarks[contour_indices[1]]  # Top 1
-        p3 = landmarks[contour_indices[2]]  # Top 2
-        p4 = landmarks[contour_indices[3]]  # Corner 2
-        p5 = landmarks[contour_indices[4]]  # Bottom 2
-        p6 = landmarks[contour_indices[5]]  # Bottom 1
-
-        v1 = _distance_2d(p2, p6)
-        v2 = _distance_2d(p3, p5)
-        h = _distance_2d(p1, p4)
-
-        if h < 1e-6:
-            return 0.0
-
-        return (v1 + v2) / (2.0 * h)
-    except (IndexError, TypeError):
-        return 0.0
-
-
-def _calculate_gaze_ratios(
-    landmarks
-) -> Tuple[float, float]:
-    """
-    Compute coordinate-invariant horizontal and vertical iris position ratios.
-    Returns: (h_ratio, v_ratio)
-    h_ratio: 0.0 (Far Left) -> 0.5 (Center) -> 1.0 (Far Right) in image space
-    v_ratio: 0.0 (Far Up)   -> 0.5 (Center) -> 1.0 (Far Down) in image space
-    """
-    try:
-        # Left Eye Landmarks
-        l_iris = landmarks[LEFT_IRIS_CENTER]
-        l_inner = landmarks[LEFT_EYE_INNER]
-        l_outer = landmarks[LEFT_EYE_OUTER]
-        l_top = landmarks[LEFT_EYE_TOP]
-        l_bot = landmarks[LEFT_EYE_BOTTOM]
-
-        # Right Eye Landmarks
-        r_iris = landmarks[RIGHT_IRIS_CENTER]
-        r_inner = landmarks[RIGHT_EYE_INNER]
-        r_outer = landmarks[RIGHT_EYE_OUTER]
-        r_top = landmarks[RIGHT_EYE_TOP]
-        r_bot = landmarks[RIGHT_EYE_BOTTOM]
-
-        # --- Left Eye Horizontal Ratio (Normalized to image coordinates) ---
-        l_x_min = min(l_inner.x, l_outer.x)
-        l_x_max = max(l_inner.x, l_outer.x)
-        l_w = max(1e-6, l_x_max - l_x_min)
-        l_h_ratio = (l_iris.x - l_x_min) / l_w
-
-        # --- Right Eye Horizontal Ratio (Normalized to image coordinates) ---
-        r_x_min = min(r_inner.x, r_outer.x)
-        r_x_max = max(r_inner.x, r_outer.x)
-        r_w = max(1e-6, r_x_max - r_x_min)
-        r_h_ratio = (r_iris.x - r_x_min) / r_w
-
-        # Combined Horizontal Ratio
-        h_ratio = max(0.0, min(1.0, (l_h_ratio + r_h_ratio) / 2.0))
-
-        # --- Vertical Ratio (Normalized to image coordinates) ---
-        l_y_min = min(l_top.y, l_bot.y)
-        l_y_max = max(l_top.y, l_bot.y)
-        l_h = max(1e-6, l_y_max - l_y_min)
-        l_v_ratio = (l_iris.y - l_y_min) / l_h
-
-        r_y_min = min(r_top.y, r_bot.y)
-        r_y_max = max(r_top.y, r_bot.y)
-        r_h = max(1e-6, r_y_max - r_y_min)
-        r_v_ratio = (r_iris.y - r_y_min) / r_h
-
-        # Combined Vertical Ratio
-        v_ratio = max(0.0, min(1.0, (l_v_ratio + r_v_ratio) / 2.0))
-
-        return h_ratio, v_ratio
-
-    except (IndexError, TypeError, AttributeError):
-        return 0.50, 0.50
-
-
-# ============================================================
-# STATEFUL EYE TRACKER CLASS
-# ============================================================
-
-class EyeTracker:
-    """
-    Maintains temporal state for blink counting, blink rate (BPM),
-    smoothed gaze tracking, and dynamic multi-factor confidence scoring.
+    Usage:
+        analyzer = EyeContactAnalyzer()
+        result = analyzer.analyze(tracker_result)  # from CandidateTracker.process()
     """
 
-    def __init__(self):
-        self.reset()
+    def __init__(
+        self,
+        ear_closed_threshold: float = 0.21,
+        gaze_center_tolerance: float = 0.18,
+        smoothing_window: int = 5,
+        max_blink_closed_frames: int = 4,
+    ) -> None:
+        self.ear_closed_threshold = ear_closed_threshold
+        self.gaze_center_tolerance = gaze_center_tolerance
+        self.smoothing_window = smoothing_window
+        self.max_blink_closed_frames = max_blink_closed_frames
 
-    def reset(self):
-        """Reset all counters and tracking history."""
-        self.blink_count: int = 0
-        self.consecutive_closed_frames: int = 0
-        self.blink_timestamps = deque(maxlen=200)
+        self._gaze_history: Deque[bool] = deque(maxlen=smoothing_window)
+        self._consecutive_closed_frames: int = 0
 
-        # Smoothed values for jitter reduction
-        self.smooth_h_ratio: float = 0.50
-        self.smooth_v_ratio: float = 0.50
-        self.smooth_ear: float = 0.28
-        self.smooth_confidence: float = 1.0
-
-        self.last_frame_time: float = time.time()
-
-    def process(self, candidate_landmarks) -> Optional[EyeContactResult]:
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+    def analyze(self, tracker_result: TrackerResult) -> EyeContactResult:
         """
-        Analyze a frame of MediaPipe candidate landmarks.
+        Analyze eye contact for the currently locked candidate.
+
+        Gating rules (never analyze the wrong / an arbitrary person):
+            - NOT_LOCKED / CANDIDATE_LOST -> unavailable, state reset.
+            - AMBIGUOUS -> identity not reliably resolved this frame;
+              return an uncertain result rather than guessing.
+            - REACQUIRING -> candidate not currently visible; uncertain.
+            - TRACKING -> compute from locked_candidate_landmarks.
         """
-        if candidate_landmarks is None or len(candidate_landmarks) < 468:
-            return None
+        status = tracker_result.tracking_status
 
-        current_time = time.time()
+        if status in (TrackingStatus.NOT_LOCKED, TrackingStatus.CANDIDATE_LOST):
+            self._reset_state()
+            return self._empty_result(status.value)
 
-        # ----------------------------------------------------
-        # 1. Eye Aspect Ratio (EAR)
-        # ----------------------------------------------------
-        ear_left = _calculate_ear(candidate_landmarks, LEFT_EYE_CONTOUR)
-        ear_right = _calculate_ear(candidate_landmarks, RIGHT_EYE_CONTOUR)
-        ear_avg = (ear_left + ear_right) / 2.0
+        if status == TrackingStatus.AMBIGUOUS:
+            # Requirement: only continue analyzing the locked candidate if
+            # it can be reliably identified. Ambiguous match == not reliable.
+            return self._empty_result(TrackingStatus.AMBIGUOUS.value)
 
-        # Exponential moving average for EAR
-        self.smooth_ear = (
-            SMOOTHING_ALPHA * ear_avg +
-            (1.0 - SMOOTHING_ALPHA) * self.smooth_ear
+        if status == TrackingStatus.REACQUIRING:
+            # Candidate not currently visible; do not fabricate a reading.
+            return self._empty_result(TrackingStatus.REACQUIRING.value)
+
+        # status == TRACKING
+        landmarks = tracker_result.locked_candidate_landmarks
+        if not landmarks or len(landmarks) <= _MAX_LANDMARK_INDEX:
+            logger.warning("Insufficient landmarks for eye-contact analysis.")
+            return self._empty_result("insufficient_landmarks")
+
+        return self._compute(landmarks)
+
+    # ------------------------------------------------------------------ #
+    # Core computation (only reached for a confidently tracked candidate)
+    # ------------------------------------------------------------------ #
+    def _compute(self, landmarks: Sequence[Landmark]) -> EyeContactResult:
+        left_ear = self._eye_aspect_ratio(landmarks, _LEFT_EYE_EAR_IDX)
+        right_ear = self._eye_aspect_ratio(landmarks, _RIGHT_EYE_EAR_IDX)
+        avg_ear = (left_ear + right_ear) / 2.0
+        eyes_open = avg_ear >= self.ear_closed_threshold
+
+        blink_detected = self._update_blink_state(eyes_open)
+
+        gaze_direction: Optional[str] = None
+        is_centered = False
+        if eyes_open:
+            gaze_direction, is_centered = self._estimate_gaze(landmarks)
+
+        self._gaze_history.append(bool(eyes_open and is_centered))
+        # Smoothed eye contact: majority of the recent window must be
+        # "centered + open" so a single noisy frame or a brief blink
+        # doesn't flip eye_contact to False.
+        eye_contact = (
+            sum(self._gaze_history) >= (len(self._gaze_history) / 2.0)
+            if self._gaze_history
+            else None
         )
-
-        # ----------------------------------------------------
-        # 2. Blink Detection State Machine
-        # ----------------------------------------------------
-        is_closed = ear_avg < EAR_BLINK_THRESHOLD
-        is_blinking = False
-
-        if is_closed:
-            self.consecutive_closed_frames += 1
-            if self.consecutive_closed_frames <= MAX_BLINK_FRAMES:
-                is_blinking = True
-        else:
-            # Check if this frame marks the end of a valid blink
-            if (
-                MIN_BLINK_FRAMES <=
-                self.consecutive_closed_frames <=
-                MAX_BLINK_FRAMES
-            ):
-                self.blink_count += 1
-                self.blink_timestamps.append(current_time)
-
-            self.consecutive_closed_frames = 0
-
-        # Compute rolling Blinks Per Minute (BPM) over last 60 seconds
-        cutoff_time = current_time - 60.0
-        while (
-            self.blink_timestamps and
-            self.blink_timestamps[0] < cutoff_time
-        ):
-            self.blink_timestamps.popleft()
-
-        recent_blinks = len(self.blink_timestamps)
-        blink_rate_bpm = float(recent_blinks)
-
-        # ----------------------------------------------------
-        # 3. Iris & Gaze Direction
-        # ----------------------------------------------------
-        raw_h_ratio, raw_v_ratio = _calculate_gaze_ratios(
-            candidate_landmarks
-        )
-
-        # Smooth gaze ratios
-        self.smooth_h_ratio = (
-            SMOOTHING_ALPHA * raw_h_ratio +
-            (1.0 - SMOOTHING_ALPHA) * self.smooth_h_ratio
-        )
-        self.smooth_v_ratio = (
-            SMOOTHING_ALPHA * raw_v_ratio +
-            (1.0 - SMOOTHING_ALPHA) * self.smooth_v_ratio
-        )
-
-        # Classify gaze direction with combined 2D quadrant classification
-        if is_closed and self.consecutive_closed_frames > MAX_BLINK_FRAMES:
-            gaze_direction = "EYES_CLOSED"
-            looking_at_screen = False
-            status = "Eyes Closed"
-        elif is_blinking:
-            gaze_direction = "BLINK"
-            looking_at_screen = True  # Natural blink during attention
-            status = "Blinking"
-        else:
-            # Horizontal state
-            is_left = self.smooth_h_ratio < H_RATIO_LEFT_THRESH
-            is_right = self.smooth_h_ratio > H_RATIO_RIGHT_THRESH
-
-            # Vertical state
-            is_up = self.smooth_v_ratio < V_RATIO_UP_THRESH
-            is_down = self.smooth_v_ratio > V_RATIO_DOWN_THRESH
-
-            if is_up and is_left:
-                gaze_direction = "UP-LEFT"
-                looking_at_screen = False
-                status = "Looking Up-Left"
-            elif is_up and is_right:
-                gaze_direction = "UP-RIGHT"
-                looking_at_screen = False
-                status = "Looking Up-Right"
-            elif is_down and is_left:
-                gaze_direction = "DOWN-LEFT"
-                looking_at_screen = False
-                status = "Looking Down-Left"
-            elif is_down and is_right:
-                gaze_direction = "DOWN-RIGHT"
-                looking_at_screen = False
-                status = "Looking Down-Right"
-            elif is_up:
-                gaze_direction = "UP"
-                looking_at_screen = False
-                status = "Looking Up"
-            elif is_down:
-                gaze_direction = "DOWN"
-                looking_at_screen = False
-                status = "Looking Down"
-            elif is_left:
-                gaze_direction = "LEFT"
-                looking_at_screen = False
-                status = "Looking Left"
-            elif is_right:
-                gaze_direction = "RIGHT"
-                looking_at_screen = False
-                status = "Looking Right"
-            else:
-                gaze_direction = "CENTER"
-                looking_at_screen = True
-                status = "Looking at Screen"
-
-        # ----------------------------------------------------
-        # 4. Multi-Factor Confidence & Eye Contact Score
-        # ----------------------------------------------------
-        # Factor A: Gaze Centrality (0.0 to 1.0)
-        h_dev = abs(self.smooth_h_ratio - 0.50)
-        v_dev = abs(self.smooth_v_ratio - 0.50)
-        gaze_centrality = max(0.0, 1.0 - (h_dev * 3.2 + v_dev * 2.5))
-
-        # Factor B: Eye Openness Stability
-        openness_score = min(1.0, max(0.0, (ear_avg - 0.12) / 0.18))
-
-        # Factor C: Left/Right Eye Symmetry
-        symmetry_diff = abs(ear_left - ear_right)
-        symmetry_score = max(0.0, 1.0 - (symmetry_diff / 0.08))
-
-        # Factor D: Blink Regularity Score (10 - 26 BPM optimal)
-        if blink_rate_bpm == 0:
-            blink_score = 0.90
-        elif 10.0 <= blink_rate_bpm <= 26.0:
-            blink_score = 1.00
-        else:
-            blink_score = max(0.40, 1.0 - abs(blink_rate_bpm - 18.0) / 25.0)
-
-        # Weighted combined confidence score
-        raw_confidence = (
-            0.45 * gaze_centrality +
-            0.25 * openness_score +
-            0.15 * symmetry_score +
-            0.15 * blink_score
-        )
-
-        if not looking_at_screen and gaze_direction != "BLINK":
-            # Penalize confidence when actively looking away
-            raw_confidence *= 0.50
-
-        # Smooth confidence score
-        self.smooth_confidence = (
-            SMOOTHING_ALPHA * raw_confidence +
-            (1.0 - SMOOTHING_ALPHA) * self.smooth_confidence
-        )
-
-        # Primary Eye Contact Score (0.0 to 1.0)
-        eye_contact_score = round(gaze_centrality, 2)
-        final_confidence = round(max(0.0, min(1.0, self.smooth_confidence)), 2)
 
         return EyeContactResult(
-            looking_at_screen=looking_at_screen,
-            score=eye_contact_score,
-            confidence=final_confidence,
-            status=status,
-            gaze_direction=gaze_direction,
-            blink_count=self.blink_count,
-            blink_rate_bpm=round(blink_rate_bpm, 1),
-            ear_avg=round(ear_avg, 3),
-            ear_left=round(ear_left, 3),
-            ear_right=round(ear_right, 3),
-            horizontal_ratio=round(self.smooth_h_ratio, 3),
-            vertical_ratio=round(self.smooth_v_ratio, 3),
-            is_blinking=is_blinking
+            eye_contact=eye_contact,
+            gaze_direction=gaze_direction if eyes_open else "eyes_closed",
+            blink_detected=blink_detected,
+            eyes_open=eyes_open,
+            confidence=0.85,  # heuristic ceiling — see module docstring
+            status=TrackingStatus.TRACKING.value,
         )
 
+    def _update_blink_state(self, eyes_open: bool) -> bool:
+        """
+        Debounced blink detection: a blink is reported on the frame the
+        eyes REOPEN after a short closure (1..max_blink_closed_frames).
+        A closure longer than that is treated as "eyes closed", not a
+        blink, and is not reported as one.
+        """
+        if not eyes_open:
+            self._consecutive_closed_frames += 1
+            return False
 
-# ============================================================
-# GLOBAL INSTANCE & MODULE ENTRY POINT
-# ============================================================
+        was_closed_briefly = 0 < self._consecutive_closed_frames <= self.max_blink_closed_frames
+        self._consecutive_closed_frames = 0
+        return was_closed_briefly
 
-_global_eye_tracker = EyeTracker()
+    def _estimate_gaze(self, landmarks: Sequence[Landmark]):
+        """
+        Approximate gaze direction from iris position relative to eye
+        corners/eyelids, averaged across both eyes. Returns
+        (direction, is_centered). See module docstring for limitations.
+        """
+        h_ratio = self._avg_ratio(
+            landmarks, _LEFT_EYE_H_IDX, _RIGHT_EYE_H_IDX, _LEFT_IRIS_CENTER_IDX, _RIGHT_IRIS_CENTER_IDX, axis="x"
+        )
+        v_ratio = self._avg_ratio(
+            landmarks, _LEFT_EYE_V_IDX, _RIGHT_EYE_V_IDX, _LEFT_IRIS_CENTER_IDX, _RIGHT_IRIS_CENTER_IDX, axis="y"
+        )
 
+        if h_ratio is None or v_ratio is None:
+            return None, False
 
-def analyze_eye_contact(
-    candidate_landmarks
-) -> Optional[EyeContactResult]:
-    """
-    Main entry point for evaluating eye contact from MediaPipe landmarks.
-    """
-    return _global_eye_tracker.process(candidate_landmarks)
+        h_dev = h_ratio - 0.5
+        v_dev = v_ratio - 0.5
 
+        if abs(h_dev) <= self.gaze_center_tolerance and abs(v_dev) <= self.gaze_center_tolerance:
+            return "center", True
 
-def reset_eye_tracking():
-    """Reset the global eye tracking history and blink counter."""
-    _global_eye_tracker.reset()
+        # Dominant axis wins to keep the label single-valued.
+        if abs(h_dev) >= abs(v_dev):
+            direction = "right" if h_dev > 0 else "left"
+        else:
+            direction = "down" if v_dev > 0 else "up"
+        return direction, False
+
+    # ------------------------------------------------------------------ #
+    # Geometry helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _eye_aspect_ratio(landmarks: Sequence[Landmark], idx) -> float:
+        """Classic EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)."""
+        p1, p2, p3, p4, p5, p6 = (landmarks[i] for i in idx)
+
+        def dist(a: Landmark, b: Landmark) -> float:
+            return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
+
+        horizontal = dist(p1, p4)
+        if horizontal < 1e-6:
+            return 1.0  # degenerate geometry -> assume open rather than divide by ~0
+        return (dist(p2, p6) + dist(p3, p5)) / (2.0 * horizontal)
+
+    @staticmethod
+    def _avg_ratio(
+        landmarks: Sequence[Landmark],
+        left_pair,
+        right_pair,
+        left_iris_idx: int,
+        right_iris_idx: int,
+        axis: str,
+    ) -> Optional[float]:
+        """
+        Normalized position of the iris between two reference landmarks
+        (e.g. outer/inner corner for x, top/bottom lid for y), 0..1,
+        averaged across both eyes.
+        """
+        def ratio(a_idx: int, b_idx: int, iris_idx: int) -> Optional[float]:
+            a = getattr(landmarks[a_idx], axis)
+            b = getattr(landmarks[b_idx], axis)
+            iris = getattr(landmarks[iris_idx], axis)
+            span = b - a
+            if abs(span) < 1e-6:
+                return None
+            return (iris - a) / span
+
+        left_ratio = ratio(left_pair[0], left_pair[1], left_iris_idx)
+        right_ratio = ratio(right_pair[0], right_pair[1], right_iris_idx)
+
+        valid = [r for r in (left_ratio, right_ratio) if r is not None]
+        if not valid:
+            return None
+        return sum(valid) / len(valid)
+
+    # ------------------------------------------------------------------ #
+    # State management
+    # ------------------------------------------------------------------ #
+    def _reset_state(self) -> None:
+        self._gaze_history.clear()
+        self._consecutive_closed_frames = 0
+
+    @staticmethod
+    def _empty_result(status: str) -> EyeContactResult:
+        return EyeContactResult(
+            eye_contact=None,
+            gaze_direction=None,
+            blink_detected=False,
+            eyes_open=None,
+            confidence=0.0,
+            status=status,
+        )
