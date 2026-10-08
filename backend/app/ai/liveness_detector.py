@@ -167,12 +167,14 @@ class LivenessDetector:
 
     def reset(self) -> None:
         """Explicitly clear all accumulated evidence and any challenge."""
+        had_state = bool(self._window or self._prev_landmarks is not None or self._active_challenge is not None)
         self._window.clear()
         self._window_start_ms = None
         self._prev_landmarks = None
         self._prev_pose = None
         self.cancel_challenge()
-        logger.info("Liveness detector reset.")
+        if had_state:
+            logger.info("Liveness detector reset.")
 
     # ------------------------------------------------------------------ #
     # Per-frame analysis

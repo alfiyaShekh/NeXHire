@@ -78,12 +78,23 @@ crashing the controller.
 
 from __future__ import annotations
 
+import os
+import sys
+
+# Ensure this directory is in sys.path so sibling imports work seamlessly
+_AI_DIR = os.path.dirname(os.path.abspath(__file__))
+if _AI_DIR not in sys.path:
+    sys.path.insert(0, _AI_DIR)
+
 import time
 import logging
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Any, Optional, List, Dict, Deque
+from typing import Any, Optional, List, Dict, Deque, Tuple
 from collections import deque
+
+import cv2
+import numpy as np
 
 logger = logging.getLogger("nexhire.session_controller")
 
@@ -163,6 +174,13 @@ class EyeInfo:
     blink_detected: Optional[bool] = None
     eye_confidence: float = 0.0
     status: str = "UNAVAILABLE"
+    score: float = 0.0
+    blink_count: int = 0
+    blink_rate_bpm: float = 0.0
+    ear_avg: float = 0.0
+    horizontal_ratio: float = 0.50
+    vertical_ratio: float = 0.50
+    is_blinking: bool = False
 
 
 @dataclass
@@ -378,7 +396,7 @@ class InterviewSessionController:
             return self._last_result or self.end_session()
 
         # ---- 1. Acquire frame -------------------------------------------------
-        if frame is None:
+        if frame is None and self.opencv_service is not None:
             frame = _safe_call(getattr(self.opencv_service, "read_frame", None))
 
         if frame is None:
@@ -394,37 +412,75 @@ class InterviewSessionController:
             self._last_result = result
             return result
 
+        bgr_frame = getattr(frame, "frame", frame)
+        frame_id = getattr(frame, "frame_id", self._frame_count)
+        timestamp_ms = getattr(frame, "timestamp_ms", int(time.time() * 1000))
+
+        if not isinstance(bgr_frame, np.ndarray) and bgr_frame is not None and not hasattr(bgr_frame, "shape"):
+            # Mock or dummy non-ndarray frame for quick tests
+            bgr_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
         # ---- 2. MediaPipe landmark/detection pass -----------------------------
-        mp_result = _safe_call(getattr(self.mediapipe_service, "process", None), frame)
+        mp_result = None
+        if self.mediapipe_service is not None:
+            try:
+                mp_result = self.mediapipe_service.process(bgr_frame, frame_id)
+            except TypeError:
+                mp_result = _safe_call(getattr(self.mediapipe_service, "process", None), bgr_frame)
+            except Exception as exc:
+                logger.debug("MediaPipe service call exception: %s", exc)
 
-        # ---- 3. Candidate identity: raw face candidates ------------------------
-        faces = _safe_call(
-            getattr(self.candidate_identity, "identify", None), frame, mp_result
-        )
-        if faces is None:
-            faces = []
+        # ---- 3 & 4. Candidate identity & Tracker ------------------------------
+        track_result = None
+        faces = getattr(mp_result, "faces", []) if mp_result is not None else []
 
-        # ---- 4. Candidate tracker: locking / recovery / grace period ----------
-        track_result = _safe_call(
-            getattr(self.candidate_tracker, "update", None), frame, faces
-        )
+        if self.candidate_tracker is not None:
+            # Auto-lock if candidate identity is not yet locked and exactly 1 face is present
+            identity = getattr(self.candidate_tracker, "identity", None)
+            is_locked = getattr(identity, "is_locked", False) if identity else False
+            if not is_locked and mp_result is not None and getattr(mp_result, "num_faces", 0) == 1:
+                _safe_call(getattr(self.candidate_tracker, "request_lock", None), mp_result)
+
+            if hasattr(self.candidate_tracker, "process"):
+                track_result = _safe_call(self.candidate_tracker.process, mp_result)
+            elif hasattr(self.candidate_tracker, "update"):
+                if self.candidate_identity is not None and hasattr(self.candidate_identity, "identify"):
+                    faces = _safe_call(getattr(self.candidate_identity, "identify", None), bgr_frame, mp_result) or faces
+                track_result = _safe_call(self.candidate_tracker.update, bgr_frame, faces)
 
         candidate_info = self._extract_candidate_info(track_result, faces)
-        locked_face = _get(track_result, "locked_face", "candidate_face", "target_face")
+        locked_face = _get(track_result, "locked_face", "candidate_face", "target_face", "locked_candidate_landmarks")
 
-        # ---- 5. Downstream analyses (only meaningful once a candidate exists) --
-        eye_result = _safe_call(
-            getattr(self.eye_contact_service, "analyze", None), frame, locked_face
-        )
-        head_result = _safe_call(
-            getattr(self.head_pose_service, "analyze", None), frame, locked_face
-        )
-        liveness_result = _safe_call(
-            getattr(self.liveness_detector, "check", None), frame, locked_face, track_result
-        )
-        phone_result = _safe_call(
-            getattr(self.phone_detection_service, "detect", None), frame
-        )
+        # ---- 5. Downstream analyses -----------------------------------------
+        eye_result = None
+        if self.eye_contact_service is not None:
+            if hasattr(self.eye_contact_service, "analyze"):
+                try:
+                    eye_result = self.eye_contact_service.analyze(track_result)
+                except (TypeError, AttributeError):
+                    eye_result = _safe_call(self.eye_contact_service.analyze, bgr_frame, locked_face)
+
+        head_result = None
+        if self.head_pose_service is not None:
+            if hasattr(self.head_pose_service, "analyze"):
+                try:
+                    head_result = self.head_pose_service.analyze(track_result)
+                except (TypeError, AttributeError):
+                    head_result = _safe_call(self.head_pose_service.analyze, bgr_frame, locked_face)
+
+        liveness_result = None
+        if self.liveness_detector is not None:
+            if hasattr(self.liveness_detector, "analyze"):
+                try:
+                    liveness_result = self.liveness_detector.analyze(track_result, eye_result, head_result, timestamp_ms)
+                except (TypeError, AttributeError):
+                    liveness_result = _safe_call(self.liveness_detector.analyze, track_result)
+            elif hasattr(self.liveness_detector, "check"):
+                liveness_result = _safe_call(self.liveness_detector.check, bgr_frame, locked_face, track_result)
+
+        phone_result = None
+        if self.phone_detection_service is not None:
+            phone_result = _safe_call(getattr(self.phone_detection_service, "detect", None), bgr_frame)
 
         eye_info = self._extract_eye_info(eye_result)
         head_info = self._extract_head_info(head_result)
@@ -505,11 +561,18 @@ class InterviewSessionController:
         if eye_result is None:
             return EyeInfo()
         return EyeInfo(
-            eye_contact=_get(eye_result, "eye_contact", "is_eye_contact"),
+            eye_contact=_get(eye_result, "eye_contact", "looking_at_screen"),
             gaze_direction=_get(eye_result, "gaze_direction", "gaze"),
             blink_detected=_get(eye_result, "blink_detected", "blink"),
             eye_confidence=float(_get(eye_result, "confidence", "eye_confidence", default=0.0) or 0.0),
             status=str(_get(eye_result, "status", default="OK")),
+            score=float(_get(eye_result, "score", default=0.0) or 0.0),
+            blink_count=int(_get(eye_result, "blink_count", default=0) or 0),
+            blink_rate_bpm=float(_get(eye_result, "blink_rate_bpm", default=0.0) or 0.0),
+            ear_avg=float(_get(eye_result, "ear_avg", default=0.0) or 0.0),
+            horizontal_ratio=float(_get(eye_result, "horizontal_ratio", default=0.50) or 0.50),
+            vertical_ratio=float(_get(eye_result, "vertical_ratio", default=0.50) or 0.50),
+            is_blinking=bool(_get(eye_result, "is_blinking", default=False)),
         )
 
     def _extract_head_info(self, head_result: Any) -> HeadPoseInfo:
@@ -692,45 +755,249 @@ class InterviewSessionController:
 
 
 # ==========================================================================
-# EXAMPLE USAGE
+# HUD & VISUALIZATION
 # ==========================================================================
 
-if __name__ == "__main__":
-    # Wire up with whatever concrete module instances your app already
-    # constructs elsewhere (import paths are illustrative only).
-    #
-    # from opencv_service import OpenCVService
-    # from mediapipe_service import MediaPipeService
-    # from candidate_identity import CandidateIdentity
-    # from candidate_tracker import CandidateTracker
-    # from eye_contact import EyeContactService
-    # from head_pose import HeadPoseService
-    # from liveness_detector import LivenessDetector
-    # from phone_detection import PhoneDetectionService
-    #
-    # controller = InterviewSessionController(
-    #     opencv_service=OpenCVService(),
-    #     mediapipe_service=MediaPipeService(),
-    #     candidate_identity=CandidateIdentity(),
-    #     candidate_tracker=CandidateTracker(),
-    #     eye_contact_service=EyeContactService(),
-    #     head_pose_service=HeadPoseService(),
-    #     liveness_detector=LivenessDetector(),
-    #     phone_detection_service=PhoneDetectionService(),
-    # )
-    # controller.start_session()
-    # try:
-    #     while True:
-    #         result = controller.process_frame()
-    #         print(result.to_dict())
-    #         if result.session.session_state == SessionState.ENDED.value:
-    #             break
-    # finally:
-    #     controller.end_session()
+def draw_session_hud(
+    frame: np.ndarray,
+    result: SessionResult,
+    phone_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+) -> np.ndarray:
+    """
+    Draw a real-time HUD telemetry overlay with Gaze Radar onto the OpenCV frame.
+    """
+    h, w = frame.shape[:2]
+    canvas = frame.copy()
 
-    logging.basicConfig(level=logging.INFO)
-    controller = InterviewSessionController()  # no modules injected -> safe no-op run
+    # Draw semi-transparent header bar & side panel
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 54), (16, 18, 24), -1)
+    cv2.rectangle(overlay, (0, h - 36), (w, h), (16, 18, 24), -1)
+    # Side telemetry card
+    cv2.rectangle(overlay, (12, 64), (390, 275), (16, 18, 24), -1)
+    cv2.addWeighted(overlay, 0.82, canvas, 0.18, 0, canvas)
+    cv2.rectangle(canvas, (12, 64), (390, 275), (60, 68, 85), 1)
+
+    # 1. Header: State & Status badge
+    state_str = result.session.session_state
+    state_colors = {
+        SessionState.ACTIVE.value: (60, 210, 60),            # Green
+        SessionState.WAITING_FOR_CANDIDATE.value: (240, 180, 0),  # Cyan/Yellow
+        SessionState.INITIALIZING.value: (240, 180, 0),
+        SessionState.WARNING.value: (0, 165, 255),            # Orange
+        SessionState.MULTIPLE_FACES.value: (50, 50, 230),     # Red
+        SessionState.CANDIDATE_LOST.value: (50, 50, 230),     # Red
+        SessionState.LIVENESS_CHECK.value: (220, 100, 255),   # Magenta
+    }
+    badge_color = state_colors.get(state_str, (180, 180, 180))
+
+    cv2.putText(canvas, "NexHire AI Proctor", (16, 34), cv2.FONT_HERSHEY_DUPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, f"STATUS: {state_str}", (w - 340, 34), cv2.FONT_HERSHEY_DUPLEX, 0.65, badge_color, 2, cv2.LINE_AA)
+
+    # 2. Side Telemetry Panel
+    y = 90
+    line_h = 24
+
+    # Candidate tracking
+    cand = result.candidate
+    cand_text = f"Candidate: {'LOCKED' if cand.candidate_locked else 'SEARCHING'} ({cand.tracking_status})"
+    cand_col = (60, 220, 60) if cand.candidate_locked and cand.candidate_found else (0, 165, 255)
+    cv2.putText(canvas, cand_text, (22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, cand_col, 1, cv2.LINE_AA)
+    y += line_h
+
+    # Faces count
+    face_text = f"Faces: {cand.face_count}"
+    face_col = (255, 255, 255) if cand.face_count == 1 else ((50, 50, 240) if cand.face_count > 1 else (180, 180, 180))
+    cv2.putText(canvas, face_text, (22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, face_col, 1, cv2.LINE_AA)
+    y += line_h
+
+    # Eye contact & Gaze
+    eye = result.eye
+    eye_str = "YES" if eye.eye_contact else ("BLINK" if eye.is_blinking or eye.blink_detected else ("NO" if eye.eye_contact is False else "N/A"))
+    eye_col = (60, 220, 60) if eye.eye_contact else ((0, 220, 255) if eye.is_blinking else (0, 80, 255))
+    gaze_dir = eye.gaze_direction or "N/A"
+    cv2.putText(canvas, f"Eye Contact: {eye_str} ({gaze_dir})", (22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, eye_col, 1, cv2.LINE_AA)
+    y += line_h
+
+    # Focus Score & Blinks / BPM
+    score_pct = int(eye.score * 100)
+    cv2.putText(canvas, f"Focus Score: {score_pct}% | Blinks: {eye.blink_count} ({eye.blink_rate_bpm:.1f} BPM)", (22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (170, 200, 255), 1, cv2.LINE_AA)
+    y += line_h
+
+    # Head Pose
+    head = result.head
+    yaw_str = f"{head.yaw:+.1f}°" if head.yaw is not None else "N/A"
+    pitch_str = f"{head.pitch:+.1f}°" if head.pitch is not None else "N/A"
+    cv2.putText(canvas, f"Head Pose: Y:{yaw_str} P:{pitch_str} ({head.pose_status})", (22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (230, 230, 230), 1, cv2.LINE_AA)
+    y += line_h
+
+    # Liveness
+    live = result.liveness
+    live_str = live.liveness_status
+    live_col = (60, 220, 60) if live.is_live else ((0, 165, 255) if live.is_live is None else (50, 50, 230))
+    cv2.putText(canvas, f"Liveness: {live_str}", (22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, live_col, 1, cv2.LINE_AA)
+    y += line_h
+
+    # Phone detection
+    phone = result.phone
+    phone_col = (50, 50, 240) if phone.phone_detected else (60, 220, 60)
+    phone_str = "DETECTED!" if phone.phone_detected else "CLEAR"
+    cv2.putText(canvas, f"Phone: {phone_str}", (22, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, phone_col, 1, cv2.LINE_AA)
+
+    # 3. Gaze Radar Widget (Embedded in Top-Right of Card)
+    radar_x = 295
+    radar_y = 78
+    radar_size = 80
+    rcx = radar_x + radar_size // 2
+    rcy = radar_y + radar_size // 2
+
+    # Background box & crosshair
+    cv2.rectangle(canvas, (radar_x, radar_y), (radar_x + radar_size, radar_y + radar_size), (26, 28, 36), -1)
+    cv2.rectangle(canvas, (radar_x, radar_y), (radar_x + radar_size, radar_y + radar_size), (65, 72, 88), 1)
+    cv2.line(canvas, (radar_x, rcy), (radar_x + radar_size, rcy), (46, 50, 62), 1)
+    cv2.line(canvas, (rcx, radar_y), (rcx, radar_y + radar_size), (46, 50, 62), 1)
+
+    # Safe attention target box
+    target_box = 13
+    cv2.rectangle(canvas, (rcx - target_box, rcy - target_box), (rcx + target_box, rcy + target_box), (0, 160, 70), 1)
+
+    # Map horizontal & vertical ratio to radar dot
+    dot_x = int(radar_x + eye.horizontal_ratio * radar_size)
+    dot_y = int(radar_y + eye.vertical_ratio * radar_size)
+    dot_x = max(radar_x + 4, min(radar_x + radar_size - 4, dot_x))
+    dot_y = max(radar_y + 4, min(radar_y + radar_size - 4, dot_y))
+
+    # Glowing radar dot
+    cv2.circle(canvas, (dot_x, dot_y), 5, eye_col, -1)
+    cv2.circle(canvas, (dot_x, dot_y), 7, (255, 255, 255), 1)
+    cv2.putText(canvas, "GAZE RADAR", (radar_x + 5, radar_y + radar_size + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (140, 145, 160), 1, cv2.LINE_AA)
+
+    # 4. Warnings alert box if any active
+    if result.session.warnings:
+        warn_text = " | ".join(result.session.warnings)
+        cv2.rectangle(canvas, (12, 288), (w - 12, 322), (0, 0, 180), -1)
+        cv2.putText(canvas, f"WARNING: {warn_text}", (20, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # 5. Footer shortcuts
+    footer_text = "[Q] Quit  |  [R] Reset Lock  |  [C] Trigger Blink Challenge"
+    cv2.putText(canvas, footer_text, (18, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
+
+    return canvas
+
+
+# ==========================================================================
+# LIVE CAMERA RUNNER
+# ==========================================================================
+
+def run_live_session(camera_index: int = 0) -> None:
+    """
+    Launches a live webcam monitoring session with real-time HUD telemetry overlays.
+    """
+    logger.info("Initializing NexHire live session...")
+
+    # Imports with sibling module resolution
+    try:
+        from opencv_service import OpenCVService, CameraError
+        from mediapipe_service import MediaPipeService
+        from candidate_identity import CandidateIdentityManager
+        from candidate_tracker import CandidateTracker
+        from eye_contact import EyeContactAnalyzer
+        from head_pose import HeadPoseEstimator
+        from liveness_detector import LivenessDetector, ChallengeType
+        from phone_detection import PhoneDetector
+    except ImportError:
+        from app.ai.opencv_service import OpenCVService, CameraError
+        from app.ai.mediapipe_service import MediaPipeService
+        from app.ai.candidate_identity import CandidateIdentityManager
+        from app.ai.candidate_tracker import CandidateTracker
+        from app.ai.eye_contact import EyeContactAnalyzer
+        from app.ai.head_pose import HeadPoseEstimator
+        from app.ai.liveness_detector import LivenessDetector, ChallengeType
+        from app.ai.phone_detection import PhoneDetector
+
+    # Resolve model path relative to this script directory
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(current_dir, "models", "face_landmarker.task")
+
+    if not os.path.exists(model_path):
+        # Fallback to local models/ in current working directory
+        model_path = "models/face_landmarker.task"
+
+    print("=" * 60)
+    print("  NexHire AI Interview Proctor - Live Camera Feed")
+    print(f"  Face Model Path : {model_path}")
+    print("  Controls        : [Q] Quit  [R] Reset Lock  [C] Challenge")
+    print("=" * 60)
+
+    # Initialize sub-services
+    mediapipe_svc = MediaPipeService(model_path=model_path)
+    try:
+        mediapipe_svc.load()
+    except Exception as exc:
+        logger.error("Failed to load Face Landmarker model: %s", exc)
+
+    identity_mgr = CandidateIdentityManager()
+    tracker = CandidateTracker(identity_manager=identity_mgr)
+    eye_svc = EyeContactAnalyzer()
+    head_svc = HeadPoseEstimator()
+    liveness_svc = LivenessDetector()
+
+    # Optional PhoneDetector
+    phone_svc = None
+    try:
+        phone_svc = PhoneDetector()
+        phone_svc.load()
+    except Exception as e:
+        logger.info("Phone detection optional module not loaded: %s", e)
+
+    controller = InterviewSessionController(
+        mediapipe_service=mediapipe_svc,
+        candidate_identity=identity_mgr,
+        candidate_tracker=tracker,
+        eye_contact_service=eye_svc,
+        head_pose_service=head_svc,
+        liveness_detector=liveness_svc,
+        phone_detection_service=phone_svc,
+    )
     controller.start_session()
-    result = controller.process_frame(frame=object())  # dummy non-None "frame"
-    print(result.to_dict())
-    controller.end_session()
+
+    try:
+        with OpenCVService(camera_index=camera_index) as cam:
+            logger.info("Webcam started at index %d. Press 'q' in window to exit.", camera_index)
+            
+            for fd in cam.stream():
+                result = controller.process_frame(frame=fd)
+                hud_frame = draw_session_hud(fd.frame, result)
+                
+                cv2.imshow("NexHire - AI Interview Monitor", hud_frame)
+                key = cv2.waitKey(1) & 0xFF
+                
+                if key == ord("q") or key == 27:  # 'q' or ESC
+                    break
+                elif key == ord("r"):  # Reset candidate lock
+                    tracker.reset()
+                    controller.start_session()
+                    logger.info("Candidate lock reset requested by user.")
+                elif key == ord("c"):  # Trigger liveness challenge
+                    liveness_svc.request_challenge(ChallengeType.BLINK, fd.timestamp_ms)
+                    logger.info("Blink challenge requested.")
+
+    except CameraError as exc:
+        logger.error("Camera access failed: %s", exc)
+        print(f"\n[ERROR] Could not open camera at index {camera_index}: {exc}")
+        print("Please check that your webcam is connected and not being used by another application.")
+    except KeyboardInterrupt:
+        logger.info("Live session interrupted by user.")
+    finally:
+        controller.end_session()
+        if mediapipe_svc.is_loaded:
+            mediapipe_svc.close()
+        if phone_svc and phone_svc.is_loaded:
+            phone_svc.close()
+        cv2.destroyAllWindows()
+        logger.info("Live session finished. Window closed.")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    run_live_session(camera_index=0)

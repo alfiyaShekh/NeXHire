@@ -1,4 +1,33 @@
+# Python Virtual Environments
+*venv*/
 venv/
+.venv/
+backend/venv/
+backend/.venv/
+
+# Python Cache & Bytecode
 __pycache__/
+*.py[cod]
+*$py.class
 *.pyc
+
+# Environment variables & secrets
 .env
+.env.*
+!.env.example
+
+# Large ML models / weights (Ultralytics auto-downloads yolov8n.pt if missing)
+*.pt
+*.onnx
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

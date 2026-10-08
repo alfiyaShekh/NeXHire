@@ -128,6 +128,19 @@ class CandidateTracker:
                 tracking_status=TrackingStatus.TRACKING,
                 locked_candidate_landmarks=matched_faces[0].landmarks,
             )
+        elif face_count == 1 and matches and matches[0][1].distance < 0.60:
+            # Single visible face with natural pose/expression deviation
+            self._missing_since_ms = None
+            self._last_confirmed_landmarks = frame_result.faces[0].landmarks
+            return TrackerResult(
+                candidate_locked=True,
+                candidate_found=True,
+                candidate_lost=False,
+                multiple_faces=False,
+                face_count=1,
+                tracking_status=TrackingStatus.TRACKING,
+                locked_candidate_landmarks=frame_result.faces[0].landmarks,
+            )
 
         # Not a single confident match this frame: either nobody
         # matched (0) or the match was inconclusive (>1). Never pick

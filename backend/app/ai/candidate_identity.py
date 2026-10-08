@@ -67,7 +67,7 @@ class CandidateIdentityManager:
         match = identity.match(some_face_result)
     """
 
-    def __init__(self, match_distance_threshold: float = 0.18) -> None:
+    def __init__(self, match_distance_threshold: float = 0.45) -> None:
         self.match_distance_threshold = match_distance_threshold
 
         self._locked: bool = False
