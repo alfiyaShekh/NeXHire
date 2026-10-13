@@ -1,1 +1,205 @@
 @import "tailwindcss";
+
+html {
+    scroll-behavior: smooth;
+}
+
+body {
+    font-family: "Inter", sans-serif;
+}
+
+
+@keyframes nexhire-marquee {
+    0% {
+        transform: translateX(0);
+    }
+
+    100% {
+        transform: translateX(-50%);
+    }
+}
+
+.moving-bar-track {
+    display: flex;
+    width: max-content;
+    animation: nexhire-marquee 30s linear infinite;
+    will-change: transform;
+}
+
+.moving-bar-track:hover {
+    animation-play-state: paused;
+}
+
+/* ================================
+   NEXHIRE INTERVIEW PREVIEW
+================================ */
+
+@keyframes questionEnter {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.question-enter {
+    animation: questionEnter 0.5s ease-out both;
+}
+
+
+@keyframes answerEnter {
+    from {
+        opacity: 0;
+        transform: translateY(6px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.answer-enter {
+    animation: answerEnter 0.4s ease-out both;
+}
+
+
+@keyframes followUpEnter {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.follow-up-enter {
+    animation: followUpEnter 0.5s ease-out both;
+}
+
+
+@keyframes waveMove {
+
+    0%,
+    100% {
+        transform: scaleY(0.45);
+        opacity: 0.35;
+    }
+
+    50% {
+        transform: scaleY(1);
+        opacity: 0.9;
+    }
+}
+
+.wave-bar {
+    transform-origin: center;
+    animation: waveMove 0.8s ease-in-out infinite alternate;
+}
+
+
+@keyframes progressRun {
+    from {
+        width: 0%;
+    }
+
+    to {
+        width: 100%;
+    }
+}
+
+.interview-progress {
+    animation: progressRun 7s linear both;
+}
+
+
+@keyframes shineMove {
+    from {
+        transform: translateX(-160px);
+    }
+
+    to {
+        transform: translateX(620px);
+    }
+}
+
+.preview-shine {
+    animation: shineMove 3.5s ease-in-out infinite;
+}
+
+
+@keyframes metricPulse {
+
+    0%,
+    100% {
+        opacity: 0.55;
+    }
+
+    50% {
+        opacity: 1;
+    }
+}
+
+.metric-progress {
+    animation: metricPulse 2s ease-in-out infinite;
+}
+
+
+@keyframes statusPulse {
+
+    0%,
+    100% {
+        opacity: 0.45;
+        transform: scale(0.85);
+    }
+
+    50% {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
+
+.status-dot {
+    animation: statusPulse 1.6s ease-in-out infinite;
+}
+
+
+@keyframes responsePulse {
+
+    0%,
+    100% {
+        opacity: 0.5;
+    }
+
+    50% {
+        opacity: 1;
+    }
+}
+
+.response-live {
+    animation: responsePulse 1s ease-in-out infinite;
+}
+
+
+@keyframes floatingStatus {
+
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+
+    50% {
+        transform: translateY(-5px);
+    }
+}
+
+.floating-status {
+    animation: floatingStatus 3s ease-in-out infinite;
+}
